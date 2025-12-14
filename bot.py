@@ -1,113 +1,84 @@
+import os
 import time
-import requests
 import json
+import requests
+import threading
+from flask import Flask
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 
-# --- DATA ANDA (SUDAH DIISI) ---
-TELEGRAM_BOT_TOKEN = "8474734004:AAHau41lj-xJDo2Ea33WyUUjrca4wUc3LyI"
-TELEGRAM_CHAT_ID = "-1001990758935"
-WATCHED_WALLET = "0xf7aCd69A02FcCe2a3962c78cc2733500D086c1a0"
+# --- SETTINGAN ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WATCHED_WALLET = os.getenv("WATCHED_WALLET")
 
-# --- KONFIGURASI BSC ---
-# Kita pakai RPC Ankr biar stabil
-RPC_URL = "https://rpc.ankr.com/bsc"
-USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
+# --- BAGIAN SERVER PALSU (Supaya jalan di Render) ---
+app = Flask(__name__)
 
-# Topik Event Transfer (Keccak256 dari "Transfer(address,address,uint256)")
-TOPIC_TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+@app.route('/')
+def home():
+    return "Bot is Alive!", 200
 
-def get_block_number():
-    """Ambil nomor blok terbaru"""
-    payload = {"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}
-    try:
-        res = requests.post(RPC_URL, json=payload, timeout=5)
-        return int(res.json()['result'], 16)
-    except:
-        return None
+def run_web_server():
+    # Render butuh port environment variable, default 10000
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
-def get_logs(from_block, to_block):
-    """Cek apakah ada transaksi USDT masuk"""
-    # Format alamat wallet kita jadi format 'Topic' (padding 0 sampai 64 karakter)
-    wallet_clean = WATCHED_WALLET.lower().replace("0x", "")
-    topic_address = "0x" + "0" * 24 + wallet_clean
-    
-    params = [{
-        "fromBlock": hex(from_block),
-        "toBlock": hex(to_block),
-        "address": USDT_CONTRACT,
-        "topics": [
-            TOPIC_TRANSFER, # Event Transfer
-            None,           # From (Siapa saja)
-            topic_address   # To (Wallet Kita)
-        ]
-    }]
-    
-    payload = {"jsonrpc":"2.0","method":"eth_getLogs","params":params,"id":1}
-    
-    try:
-        res = requests.post(RPC_URL, json=payload, timeout=10)
-        data = res.json()
-        if 'result' in data:
-            return data['result']
-    except Exception as e:
-        print(f"Error Log: {e}")
-    return []
-
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        requests.post(url, json=payload)
-    except:
-        pass
-
-def main():
-    print(f"🚀 Bot Termux Berjalan!")
-    print(f"👀 Memantau: {WATCHED_WALLET}")
-    send_telegram(f"📱 <b>Bot Termux Online!</b>\nWallet: {WATCHED_WALLET}")
-    
-    last_block = get_block_number()
-    if not last_block:
-        print("Gagal koneksi awal. Cek internet.")
+# --- BAGIAN BOT ---
+def start_bot():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Error: Token belum diisi di Environment Variables")
         return
 
-    print(f"⏳ Mulai dari blok: {last_block}")
+    BSC_RPC_URL = "https://rpc.ankr.com/bsc"
+    USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
+    
+    w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL))
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    
+    # ABI Ringkas
+    ERC20_ABI = json.loads('[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"from","type":"address"},{"indexed":true,"internalType":"address","name":"to","type":"address"},{"indexed":false,"internalType":"uint256","name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]')
+    contract = w3.eth.contract(address=USDT_CONTRACT, abi=ERC20_ABI)
+    target_address = w3.to_checksum_address(WATCHED_WALLET)
+    
+    # Kirim notif saat start
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
+                  json={"chat_id": TELEGRAM_CHAT_ID, "text": "🤖 Bot Render Siap!"})
+
+    last_block = w3.eth.block_number
+    print(f"Mulai dari blok {last_block}")
 
     while True:
         try:
-            current_block = get_block_number()
-            
-            if current_block and current_block > last_block:
-                # Cek logs
-                logs = get_logs(last_block + 1, current_block)
-                
-                for log in logs:
-                    tx_hash = log['transactionHash']
-                    # Konversi Hex Amount ke Decimal
-                    amount_hex = log['data']
-                    amount_float = int(amount_hex, 16) / 10**18
+            current_block = w3.eth.block_number
+            if current_block > last_block:
+                try:
+                    logs = contract.events.Transfer.get_logs(
+                        fromBlock=last_block + 1,
+                        toBlock=current_block,
+                        argument_filters={'to': target_address}
+                    )
                     
-                    if amount_float > 0.1: # Minimal 0.1 USDT
-                        print(f"💰 DAPAT: {amount_float} USDT | {tx_hash}")
-                        msg = (
-                            f"🚨 <b>USDT MASUK!</b>\n\n"
-                            f"💵 <b>Jumlah:</b> {amount_float:,.2f} USDT\n"
-                            f"🔗 <b>Tx Hash:</b> <code>{tx_hash}</code>\n\n"
-                            f"<a href='https://bscscan.com/tx/{tx_hash}'>BscScan</a>"
-                        )
-                        send_telegram(msg)
+                    for event in logs:
+                        tx = event['transactionHash'].hex()
+                        amt = event['args']['value'] / 10**18
+                        
+                        if amt >= 0.1: # Filter nominal
+                            msg = f"🚨 USDT MASUK!\n💵 {amt:,.2f} USDT\n🔗 {tx}"
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
+                                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+                except Exception as e:
+                    print(f"Error scan: {e}")
                 
                 last_block = current_block
-                print(f"✅ Blok {current_block} Aman...")
-            
-            # Istirahat 5 detik
-            time.sleep(5)
-            
-        except KeyboardInterrupt:
-            print("\nBot berhenti.")
-            break
-        except Exception as e:
-            print(f"Error loop: {e}")
-            time.sleep(5)
+            time.sleep(4)
+        except:
+            time.sleep(10)
 
 if __name__ == "__main__":
-    main()
+    # Jalankan Server Palsu di Thread terpisah
+    t = threading.Thread(target=run_web_server)
+    t.start()
+    
+    # Jalankan Bot Utama
+    start_bot()
